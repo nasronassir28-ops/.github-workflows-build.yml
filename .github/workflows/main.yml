@@ -1,0 +1,592 @@
+name: Build NAS TV
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK
+        run: |
+          sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.6.0
+
+      - name: Create NAS TV project
+        shell: bash
+        run: |
+          mkdir -p app/src/main/java/com/nastv/app
+          mkdir -p app/src/main/res/values
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "NAS-TV"
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '9.5.0' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.nastv.app'
+              compileSdk 36
+
+              defaultConfig {
+                  applicationId 'com.nastv.app'
+                  minSdk 23
+                  targetSdk 36
+                  versionCode 1
+                  versionName '1.0'
+              }
+          }
+
+          dependencies {
+              implementation 'androidx.media3:media3-exoplayer:1.11.1'
+              implementation 'androidx.media3:media3-exoplayer-hls:1.11.1'
+              implementation 'androidx.media3:media3-ui:1.11.1'
+          }
+          EOF
+
+          cat > app/src/main/res/values/styles.xml <<'EOF'
+          <resources>
+              <style name="AppTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+                  <item name="android:fontFamily">sans</item>
+                  <item name="android:colorAccent">#00BFA5</item>
+                  <item name="android:navigationBarColor">#073B3A</item>
+                  <item name="android:statusBarColor">#073B3A</item>
+                  <item name="android:windowLightStatusBar">false</item>
+                  <item name="android:windowActionModeOverlay">true</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+
+              <application
+                  android:allowBackup="true"
+                  android:label="NAS TV"
+                  android:theme="@style/AppTheme"
+                  android:usesCleartextTraffic="false">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden"
+                      android:screenOrientation="unspecified"
+                      android:exported="true">
+
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/nastv/app/MainActivity.java <<'EOF'
+          package com.nastv.app;
+
+          import android.app.*;
+          import android.os.*;
+          import android.content.*;
+          import android.graphics.Color;
+          import android.net.Uri;
+          import android.view.*;
+          import android.view.inputmethod.InputMethodManager;
+          import android.widget.*;
+          import android.text.*;
+          import org.json.*;
+          import java.io.*;
+          import java.util.*;
+
+          import androidx.media3.common.*;
+          import androidx.media3.exoplayer.*;
+          import androidx.media3.exoplayer.hls.*;
+          import androidx.media3.ui.PlayerView;
+
+          public class MainActivity extends Activity {
+
+              int teal = Color.rgb(0,191,165);
+              int dark = Color.rgb(7,59,58);
+              LinearLayout root, header, body, list;
+              EditText search;
+              PlayerView playerView;
+              ExoPlayer player;
+              TextView nowPlaying;
+              ArrayList<Channel> channels = new ArrayList<>();
+              String currentCategory = "الكل";
+              String currentUrl = "";
+              boolean favoritesOnly = false;
+              boolean fullscreen = false;
+
+              android.content.SharedPreferences prefs;
+
+              static class Channel {
+                  String name, url, category;
+                  boolean favorite;
+
+                  Channel(String n, String u, String c, boolean f) {
+                      name=n; url=u; category=c; favorite=f;
+                  }
+              }
+
+              @Override
+              public void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  getWindow().setStatusBarColor(dark);
+                  getWindow().setNavigationBarColor(dark);
+
+                  prefs = getSharedPreferences("nas_tv", MODE_PRIVATE);
+                  loadChannels();
+                  buildUI();
+              }
+
+              int dp(float x) {
+                  return (int)(x * getResources().getDisplayMetrics().density);
+              }
+
+              TextView text(String value, int size, int color) {
+                  TextView t = new TextView(this);
+                  t.setText(value);
+                  t.setTextSize(size);
+                  t.setTextColor(color);
+                  t.setGravity(Gravity.CENTER);
+                  return t;
+              }
+
+              GradientDrawable bg(int color, int radius) {
+                  GradientDrawable d = new GradientDrawable();
+                  d.setColor(color);
+                  d.setCornerRadius(dp(radius));
+                  return d;
+              }
+
+              LinearLayout column() {
+                  LinearLayout l = new LinearLayout(this);
+                  l.setOrientation(LinearLayout.VERTICAL);
+                  return l;
+              }
+
+              LinearLayout row() {
+                  LinearLayout l = new LinearLayout(this);
+                  l.setOrientation(LinearLayout.HORIZONTAL);
+                  l.setGravity(Gravity.CENTER_VERTICAL);
+                  return l;
+              }
+
+              Button button(String label) {
+                  Button b = new Button(this);
+                  b.setText(label);
+                  b.setTextColor(Color.WHITE);
+                  b.setTextSize(12);
+                  b.setAllCaps(false);
+                  b.setBackground(bg(teal, 12));
+                  return b;
+              }
+
+              void buildUI() {
+                  root = column();
+                  root.setBackgroundColor(Color.rgb(244,249,248));
+                  setContentView(root);
+
+                  header = column();
+                  header.setPadding(dp(12),dp(8),dp(12),dp(8));
+                  header.setBackgroundColor(dark);
+                  root.addView(header);
+
+                  TextView title = text("NAS TV",28,Color.WHITE);
+                  title.setTypeface(null,1);
+                  header.addView(title);
+
+                  TextView subtitle = text("التلفزيون في مكان واحد",13,0xFFB8EAE2);
+                  header.addView(subtitle);
+
+                  LinearLayout controls = row();
+                  controls.setPadding(dp(6),dp(5),dp(6),dp(5));
+                  header.addView(controls);
+
+                  Button importBtn = button("استيراد M3U");
+                  controls.addView(importBtn,new LinearLayout.LayoutParams(0,dp(48),1));
+                  importBtn.setOnClickListener(v -> choosePlaylist());
+
+                  Button addBtn = button("إضافة قناة");
+                  LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0,dp(48),1);
+                  p.setMargins(dp(6),0,0,0);
+                  controls.addView(addBtn,p);
+                  addBtn.setOnClickListener(v -> addChannelDialog());
+
+                  playerView = new PlayerView(this);
+                  playerView.setUseController(true);
+                  playerView.setBackgroundColor(Color.BLACK);
+                  root.addView(playerView,new LinearLayout.LayoutParams(
+                      -1,dp(220)));
+
+                  nowPlaying = text("اختر قناة للمشاهدة",15,dark);
+                  nowPlaying.setPadding(dp(8),dp(8),dp(8),dp(8));
+                  root.addView(nowPlaying);
+
+                  search = new EditText(this);
+                  search.setSingleLine(true);
+                  search.setTextSize(14);
+                  search.setHint("ابحث عن قناة...");
+                  search.setPadding(dp(12),0,dp(12),0);
+                  search.setBackground(bg(Color.WHITE,14));
+                  LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(-1,dp(48));
+                  sp.setMargins(dp(10),dp(5),dp(10),dp(5));
+                  root.addView(search,sp);
+
+                  search.addTextChangedListener(new TextWatcher() {
+                      public void beforeTextChanged(CharSequence s,int st,int c,int a){}
+                      public void onTextChanged(CharSequence s,int st,int before,int count){
+                          renderChannels();
+                      }
+                      public void afterTextChanged(Editable e){}
+                  });
+
+                  HorizontalScrollView hsv = new HorizontalScrollView(this);
+                  hsv.setHorizontalScrollBarEnabled(false);
+                  LinearLayout cats = row();
+                  cats.setPadding(dp(5),dp(5),dp(5),dp(5));
+                  hsv.addView(cats);
+                  root.addView(hsv);
+
+                  String[] names = {"الكل","الجزائر","عربية","أخبار","رياضة","وثائقي","أطفال","المفضلة"};
+                  for(String name:names) {
+                      Button c = button(name);
+                      LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(-2,dp(42));
+                      cp.setMargins(dp(3),0,dp(3),0);
+                      cats.addView(c,cp);
+                      c.setOnClickListener(v -> {
+                          favoritesOnly = name.equals("المفضلة");
+                          currentCategory = name;
+                          renderChannels();
+                      });
+                  }
+
+                  ScrollView scroll = new ScrollView(this);
+                  root.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));
+                  list = column();
+                  list.setPadding(dp(8),dp(5),dp(8),dp(10));
+                  scroll.addView(list);
+
+                  renderChannels();
+              }
+
+              void initPlayer() {
+                  if(player != null) return;
+                  player = new ExoPlayer.Builder(this).build();
+                  playerView.setPlayer(player);
+              }
+
+              void play(Channel c) {
+                  if(c.url == null || c.url.trim().isEmpty()) {
+                      new AlertDialog.Builder(this)
+                          .setTitle(c.name)
+                          .setMessage("لم تتم إضافة رابط بث مباشر لهذه القناة. أضف رابط M3U8 صالحاً تملك حق استخدامه.")
+                          .setPositiveButton("حسناً",null).show();
+                      return;
+                  }
+
+                  try {
+                      initPlayer();
+                      currentUrl = c.url;
+                      nowPlaying.setText("يتم تشغيل: " + c.name);
+                      MediaItem item = MediaItem.fromUri(Uri.parse(c.url));
+                      player.setMediaItem(item);
+                      player.prepare();
+                      player.play();
+                  } catch(Exception e) {
+                      Toast.makeText(this,"تعذر تشغيل رابط القناة",Toast.LENGTH_LONG).show();
+                  }
+              }
+
+              void renderChannels() {
+                  if(list == null) return;
+                  list.removeAllViews();
+
+                  String q = search == null ? "" : search.getText().toString().trim().toLowerCase();
+
+                  for(Channel c : channels) {
+                      if(favoritesOnly && !c.favorite) continue;
+                      if(!currentCategory.equals("الكل") &&
+                         !currentCategory.equals("المفضلة") &&
+                         !c.category.equals(currentCategory)) continue;
+                      if(!c.name.toLowerCase().contains(q)) continue;
+
+                      LinearLayout card = row();
+                      card.setPadding(dp(10),dp(5),dp(10),dp(5));
+                      card.setBackground(bg(Color.WHITE,14));
+                      LinearLayout.LayoutParams cardP = new LinearLayout.LayoutParams(-1,dp(65));
+                      cardP.setMargins(0,dp(4),0,dp(4));
+                      list.addView(card,cardP);
+
+                      TextView icon = text("▶",22,teal);
+                      card.addView(icon,new LinearLayout.LayoutParams(dp(45),-1));
+
+                      LinearLayout info = column();
+                      info.setGravity(Gravity.CENTER_VERTICAL);
+                      card.addView(info,new LinearLayout.LayoutParams(0,-1,1));
+
+                      TextView name = text(c.name,15,dark);
+                      name.setGravity(Gravity.RIGHT|Gravity.CENTER_VERTICAL);
+                      info.addView(name);
+
+                      TextView category = text(c.category,11,0xFF777777);
+                      category.setGravity(Gravity.RIGHT|Gravity.CENTER_VERTICAL);
+                      info.addView(category);
+
+                      TextView fav = text(c.favorite ? "★" : "☆",25,teal);
+                      card.addView(fav,new LinearLayout.LayoutParams(dp(42),-1));
+                      fav.setOnClickListener(v -> {
+                          c.favorite = !c.favorite;
+                          saveChannels();
+                          renderChannels();
+                      });
+
+                      card.setOnClickListener(v -> play(c));
+                      card.setOnLongClickListener(v -> {
+                          editChannelDialog(c);
+                          return true;
+                      });
+                  }
+
+                  if(list.getChildCount()==0) {
+                      TextView empty = text("لا توجد قنوات في هذا القسم. استورد قائمة M3U أو أضف قناة.",14,dark);
+                      empty.setPadding(dp(12),dp(25),dp(12),dp(25));
+                      list.addView(empty);
+                  }
+              }
+
+              void choosePlaylist() {
+                  Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                  i.addCategory(Intent.CATEGORY_OPENABLE);
+                  i.setType("*/*");
+                  startActivityForResult(i,100);
+              }
+
+              @Override
+              protected void onActivityResult(int requestCode,int resultCode,Intent data) {
+                  super.onActivityResult(requestCode,resultCode,data);
+                  if(requestCode==100 && resultCode==RESULT_OK && data!=null) {
+                      Uri uri = data.getData();
+                      try {
+                          InputStream in = getContentResolver().openInputStream(uri);
+                          BufferedReader br = new BufferedReader(new InputStreamReader(in,"UTF-8"));
+                          String line, name = null, category = "الكل";
+                          int added = 0;
+
+                          while((line=br.readLine())!=null) {
+                              line=line.trim();
+                              if(line.startsWith("#EXTINF")) {
+                                  int comma=line.lastIndexOf(',');
+                                  name = comma>=0 ? line.substring(comma+1).trim() : "قناة جديدة";
+                                  int g=line.indexOf("group-title=");
+                                  if(g>=0) {
+                                      int a=line.indexOf('"',g);
+                                      int z=a>=0 ? line.indexOf('"',a+1) : -1;
+                                      if(a>=0 && z>a) category=mapCategory(line.substring(a+1,z));
+                                  }
+                              } else if(!line.isEmpty() && !line.startsWith("#") && name!=null) {
+                                  if(line.startsWith("http://") || line.startsWith("https://")) {
+                                      channels.add(new Channel(name,line,category,false));
+                                      added++;
+                                  }
+                                  name=null;
+                                  category="الكل";
+                              }
+                          }
+
+                          br.close();
+                          saveChannels();
+                          renderChannels();
+                          Toast.makeText(this,"تم استيراد "+added+" قناة",Toast.LENGTH_LONG).show();
+
+                      } catch(Exception e) {
+                          Toast.makeText(this,"تعذر قراءة القائمة. تحقق من ملف M3U.",Toast.LENGTH_LONG).show();
+                      }
+                  }
+              }
+
+              String mapCategory(String s) {
+                  String x=s.toLowerCase();
+                  if(x.contains("sport") || x.contains("رياض")) return "رياضة";
+                  if(x.contains("news") || x.contains("أخبار")) return "أخبار";
+                  if(x.contains("document") || x.contains("وثائق")) return "وثائقي";
+                  if(x.contains("kids") || x.contains("children") || x.contains("أطفال")) return "أطفال";
+                  if(x.contains("alger") || x.contains("جزائر")) return "الجزائر";
+                  if(x.contains("arab") || x.contains("عرب")) return "عربية";
+                  return "الكل";
+              }
+
+              void addChannelDialog() {
+                  LinearLayout box = column();
+                  box.setPadding(dp(15),dp(8),dp(15),dp(8));
+
+                  EditText n = new EditText(this);
+                  n.setHint("اسم القناة");
+                  box.addView(n);
+
+                  EditText u = new EditText(this);
+                  u.setHint("رابط البث المباشر M3U8");
+                  u.setInputType( android.text.InputType.TYPE_TEXT_VARIATION_URI );
+                  box.addView(u);
+
+                  EditText c = new EditText(this);
+                  c.setHint("القسم: الجزائر / عربية / أخبار / رياضة...");
+                  box.addView(c);
+
+                  new AlertDialog.Builder(this)
+                      .setTitle("إضافة قناة")
+                      .setView(box)
+                      .setPositiveButton("حفظ",(d,w)->{
+                          String name=n.getText().toString().trim();
+                          String url=u.getText().toString().trim();
+                          String cat=c.getText().toString().trim();
+                          if(name.isEmpty() || url.isEmpty() ||
+                             !(url.startsWith("https://") || url.startsWith("http://"))) {
+                              Toast.makeText(this,"أدخل الاسم ورابطاً صحيحاً",Toast.LENGTH_LONG).show();
+                              return;
+                          }
+                          channels.add(new Channel(name,url,cat.isEmpty()?"الكل":mapCategory(cat),false));
+                          saveChannels();
+                          renderChannels();
+                      })
+                      .setNegativeButton("إلغاء",null).show();
+              }
+
+              void editChannelDialog(Channel c) {
+                  String[] opts={"تشغيل القناة","تعديل الرابط أو الاسم","حذف القناة"};
+                  new AlertDialog.Builder(this)
+                      .setTitle(c.name)
+                      .setItems(opts,(d,which)->{
+                          if(which==0) play(c);
+                          if(which==1) {
+                              LinearLayout box=column();
+                              EditText n=new EditText(this); n.setText(c.name); box.addView(n);
+                              EditText u=new EditText(this); u.setText(c.url); box.addView(u);
+                              new AlertDialog.Builder(this).setTitle("تعديل القناة")
+                                  .setView(box)
+                                  .setPositiveButton("حفظ",(x,y)->{
+                                      c.name=n.getText().toString().trim();
+                                      c.url=u.getText().toString().trim();
+                                      saveChannels(); renderChannels();
+                                  }).setNegativeButton("إلغاء",null).show();
+                          }
+                          if(which==2) {
+                              new AlertDialog.Builder(this).setMessage("هل تريد حذف القناة؟")
+                                  .setPositiveButton("حذف",(x,y)->{
+                                      channels.remove(c); saveChannels(); renderChannels();
+                                  }).setNegativeButton("إلغاء",null).show();
+                          }
+                      }).show();
+              }
+
+              void saveChannels() {
+                  try {
+                      JSONArray a=new JSONArray();
+                      for(Channel c:channels) {
+                          JSONObject o=new JSONObject();
+                          o.put("name",c.name);
+                          o.put("url",c.url);
+                          o.put("category",c.category);
+                          o.put("favorite",c.favorite);
+                          a.put(o);
+                      }
+                      prefs.edit().putString("channels",a.toString()).apply();
+                  } catch(Exception ignored) {}
+              }
+
+              void loadChannels() {
+                  try {
+                      String raw=prefs.getString("channels","[]");
+                      JSONArray a=new JSONArray(raw);
+                      for(int i=0;i<a.length();i++) {
+                          JSONObject o=a.getJSONObject(i);
+                          channels.add(new Channel(
+                              o.optString("name"),
+                              o.optString("url"),
+                              o.optString("category","الكل"),
+                              o.optBoolean("favorite",false)
+                          ));
+                      }
+                  } catch(Exception ignored) {}
+              }
+
+              @Override
+              protected void onDestroy() {
+                  super.onDestroy();
+                  if(player!=null) {
+                      player.release();
+                      player=null;
+                  }
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if(fullscreen) {
+                      fullscreen=false;
+                      getWindow().getDecorView().setSystemUiVisibility(0);
+                  } else {
+                      super.onBackPressed();
+                  }
+              }
+          }
+          EOF
+
+      - name: Build APK
+        run: gradle --no-daemon assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NAS-TV-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
